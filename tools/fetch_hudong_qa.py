@@ -451,6 +451,106 @@ def write_outputs(root: Path, stock: Stock, items: list[QAItem]) -> Path:
     return stock_dir
 
 
+
+def wikilink_path(path: Path, root: Path) -> str:
+    """Return an Obsidian-friendly wiki-link path without .md suffix."""
+    rel = path.resolve().relative_to(root.resolve()).as_posix()
+    if rel.endswith(".md"):
+        rel = rel[:-3]
+    return rel
+
+
+
+def write_incremental_outputs(root: Path, run_date: str, incremental: dict[Stock, list[QAItem]]) -> None:
+    """Write a daily incremental index and per-stock incremental detail notes."""
+    non_empty = {stock: items for stock, items in incremental.items() if items}
+    if not non_empty:
+        sys.stderr.write("No fresh incremental Q&A; daily incremental note skipped.\n")
+        return
+
+    inc_dir = root / "增量问答"
+    detail_dir = inc_dir / run_date
+    detail_dir.mkdir(parents=True, exist_ok=True)
+
+    index_path = inc_dir / f"增量问答_{run_date}.md"
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total = sum(len(items) for items in non_empty.values())
+    lines = [
+        "---",
+        f"date: {run_date}",
+        "type: 增量互动问答索引",
+        f"updated: {now_text}",
+        f"stock_count: {len(non_empty)}",
+        f"qa_count: {total}",
+        "---",
+        "",
+        f"# 增量问答_{run_date}",
+        "",
+        f"- 更新时间: {now_text}",
+        f"- 涉及股票数: {len(non_empty)}",
+        f"- 新增问答数: {total}",
+        "",
+        "## 股票列表",
+        "",
+        "| 股票 | 新增问答数 | 最新答复时间 | 增量明细 | 完整汇总 |",
+        "|---|---:|---|---|---|",
+    ]
+
+    for stock, items in sorted(non_empty.items(), key=lambda kv: kv[0].code):
+        sorted_items = sorted(items, key=qa_sort_key, reverse=True)
+        stock_dir_name = f"{stock.code}_{safe_filename(stock.name)}_互动问答"
+        detail_path = detail_dir / f"{stock.code}_{safe_filename(stock.name)}_增量问答_{run_date}.md"
+        summary_path = root / stock_dir_name / "00_问答汇总.md"
+        detail_lines = [
+            "---",
+            f"date: {run_date}",
+            f"stock_code: {stock.code}",
+            f"stock_name: {stock.name}",
+            "type: 股票增量互动问答",
+            f"updated: {now_text}",
+            f"qa_count: {len(sorted_items)}",
+            "---",
+            "",
+            f"# {stock.code} {stock.name} 增量问答_{run_date}",
+            "",
+            f"- 更新时间: {now_text}",
+            f"- 新增问答数: {len(sorted_items)}",
+            f"- 完整汇总: [[{wikilink_path(summary_path, root)}]]",
+            "",
+        ]
+        for item in sorted_items:
+            detail_lines.extend([
+                f"## {item.answer_time or item.ask_time or 'unknown-time'}",
+                "",
+                f"- 来源: {item.source}",
+                f"- 提问者: {item.ask_user or '未知'}",
+                f"- 提问时间: {item.ask_time or '未知'}",
+                f"- 答复时间: {item.answer_time or '未知'}",
+                "",
+                "**问:**",
+                "",
+                item.question or "无",
+                "",
+                "**答:**",
+                "",
+                item.answer or "无",
+                "",
+                "---",
+                "",
+            ])
+        detail_path.write_text("\n".join(detail_lines).rstrip() + "\n", encoding="utf-8")
+
+        latest = sorted_items[0].answer_time or sorted_items[0].ask_time or ""
+        lines.append(
+            f"| {stock.code} {stock.name} | {len(sorted_items)} | {latest} | "
+            f"[[{wikilink_path(detail_path, root)}|查看增量]] | "
+            f"[[{wikilink_path(summary_path, root)}|完整汇总]] |"
+        )
+
+    lines.extend(["", "## 说明", "", "本页由每日增量采集任务自动生成；仅列出本次运行新抓取到的互动问答。", ""])
+    index_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    sys.stderr.write(f"Daily incremental note saved -> {index_path}\n")
+
 def choose_stocks(stocks: list[Stock], code: str | None, name: str | None, limit: int | None) -> list[Stock]:
     result = stocks
     if code:
@@ -589,6 +689,8 @@ def main(argv: list[str] | None = None) -> int:
 
     client = HttpClient(min_delay=args.min_delay, max_delay=args.max_delay, retries=args.retries)
     sys.stderr.write(f"Matched {len(stocks)} stock(s). Output root: {root}\n")
+    run_date = datetime.now().strftime("%Y%m%d")
+    incremental_by_stock: dict[Stock, list[QAItem]] = {}
 
     for stock in stocks:
         stock_dir = root / f"{stock.code}_{safe_filename(stock.name)}_互动问答"
@@ -605,10 +707,16 @@ def main(argv: list[str] | None = None) -> int:
             max_pages=args.max_pages,
             full=args.full,
         )
+        existing_ids = {item.id for item in existing if item.id}
+        fresh_new = [item for item in fresh if item.id and item.id not in existing_ids]
         merged = sorted(fresh, key=qa_sort_key, reverse=True) if args.replace else merge_items(existing, fresh)
         out_dir = write_outputs(root, stock, merged)
+        incremental_by_stock[stock] = fresh_new
         mode = "replace" if args.replace else "merge"
-        sys.stderr.write(f"Saved {len(merged)} item(s), fresh {len(fresh)}, mode {mode} -> {out_dir}\n")
+        sys.stderr.write(f"Saved {len(merged)} item(s), fresh {len(fresh)}, new {len(fresh_new)}, mode {mode} -> {out_dir}\n")
+
+    if args.incremental and not args.replace:
+        write_incremental_outputs(root, run_date, incremental_by_stock)
 
     return 0
 
